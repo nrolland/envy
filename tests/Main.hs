@@ -1,21 +1,40 @@
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE DeriveGeneric              #-}
 ------------------------------------------------------------------------------
 module Main ( main ) where
 ------------------------------------------------------------------------------
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import           Data.Int
+import           Data.List (isInfixOf)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as LT
 import           Data.Time
 import           Data.Word
+import           GHC.Generics
 import           System.Envy
 import           Test.Hspec
 import           Test.QuickCheck
 import           Test.QuickCheck.Instances ()
 import           Test.QuickCheck.Monadic
+
+
+
+------------------------------------------------------------------------------
+data UserInfo = UserInfo {
+      userName :: String
+    , userAge :: Int
+  } deriving (Show, Eq, Generic)
+
+
+-- | Generic instance
+instance FromEnv UserInfo
+
+instance Arbitrary UserInfo where
+  arbitrary = UserInfo <$> arbitrary <*> arbitrary
+
 ------------------------------------------------------------------------------
 data ConnectInfo = ConnectInfo {
       pgHost :: String
@@ -23,7 +42,14 @@ data ConnectInfo = ConnectInfo {
     , pgUser :: String
     , pgPass :: String
     , pgDB   :: String
-  } deriving (Show, Eq)
+  } deriving (Show, Eq, Generic)
+
+
+instance DefConfig ConnectInfo where
+  defConfig = ConnectInfo "localhost" 5432 "user" "pass" "db"
+
+-- | Generic instance with default values
+instance FromEnv ConnectInfo
 
 instance Arbitrary ConnectInfo where
     arbitrary = ConnectInfo <$> nonulls
@@ -52,11 +78,11 @@ instance Show PGConfig where
 -- | FromEnv Instances, supports popular aeson combinators *and* IO
 -- for dealing with connection pools
 instance FromEnv PGConfig where
-  fromEnv = PGConfig <$> (ConnectInfo <$> envMaybe "PG_HOST" .!= "localhost"
-                                      <*> env "PG_PORT"
-                                      <*> env "PG_USER"
-                                      <*> env "PG_PASS"
-                                      <*> env "PG_DB")
+  fromEnv _ = PGConfig <$> (ConnectInfo <$> envMaybe "PG_HOST" .!= "localhost"
+                                        <*> env "PG_PORT"
+                                        <*> env "PG_USER"
+                                        <*> env "PG_PASS"
+                                        <*> env "PG_DB")
 
 ------------------------------------------------------------------------------
 -- | To Environment Instances
@@ -107,10 +133,41 @@ main = hspec $ do
      \(x :: T.Text) -> Just x == fromVar (toVar x)
     it "() Var isomorphism" $ property $
      \(x :: ()) -> Just x == fromVar (toVar x)
-  describe "Can set to and from environment" $
+  describe "Can set to and from environment" $ do
     it "Isomorphism through setEnvironment['] and decodeEnv" $ property $
       \(pgConf::PGConfig) -> monadicIO $ do
         res <- run $ do
                  _ <- setEnvironment' pgConf
                  decodeEnv
         assert $ res == Right pgConf
+    it "Storing and retrieving var" $ property $
+      \(x::String) -> monadicIO $ do
+        res <- run $ do
+                 _ <- setEnvironment $ makeEnv [ "HSPECENVY_" .= toVar x]
+                 runEnv $ env  "HSPECENVY_"
+        assert $ if isInfixOf "\NUL" x then True else res == Right x
+  describe "Can use generic FromEnv" $
+    it "Isomorphism through setEnvironment and decodeEnv" $ property $
+      \(ci::ConnectInfo) -> monadicIO $ do
+        res <- run $ do
+                 let ConnectInfo{..} = ci
+                 _ <- setEnvironment $
+                          makeEnv [ "PG_HOST" .= pgHost
+                                  , "PG_PORT" .= pgPort
+                                  , "PG_USER" .= pgUser
+                                  , "PG_PASS" .= pgPass
+                                  , "PG_DB"   .= pgDB
+                                  ]
+                 decodeWithDefaults (defConfig :: ConnectInfo)
+        assert $ res == ci
+  describe "Can use generic FromEnvNoDefault" $
+    it "Isomorphism through setEnvironment and decodeEnv" $ property $
+      \(u::UserInfo) -> monadicIO $ do
+        res <- run $ do
+                 let UserInfo{..} = u
+                 _ <- setEnvironment $
+                          makeEnv [ "USER_NAME" .= (userName ++ "")
+                                  , "USER_AGE" .= userAge
+                                  ]
+                 decodeEnv
+        assert $  if isInfixOf "\NUL" (userName u) then True else res == Right u
