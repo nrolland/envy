@@ -166,8 +166,23 @@ main = hspec $ do
         res <- run $ do
                  let UserInfo{..} = u
                  _ <- setEnvironment $
-                          makeEnv [ "USER_NAME" .= (userName ++ "")
+                          makeEnv [ "USER_NAME" .= userName
                                   , "USER_AGE" .= userAge
                                   ]
-                 decodeEnv
+                 decodeRaw
         assert $  if isInfixOf "\NUL" (userName u) then True else res == Right u
+  describe "Can use report Errors correctly" $
+    it "for missing fields" $ property $
+      \(u::UserInfo) -> monadicIO $ do
+        res :: Either Errors UserInfo <- run $ do
+                 let UserInfo{..} = u
+                 _ <- unsetEnvironment $
+                          makeEnv [ "USER_NAME" .= userName
+                                  , "USER_AGE" .= userAge
+                                  ]
+                 decodeRaw
+        assert $ case res of
+                   Left e -> let s = show e in
+                              isInfixOf "USER_NAME" s && isInfixOf "USER_AGE" s
+                   Right _ -> False
+

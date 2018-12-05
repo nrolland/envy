@@ -51,11 +51,14 @@ module System.Envy
        , ToEnv   (..)
        , Var     (..)
        , EnvList
+       , Errors
        , Parser  (..)
         -- * Functions
-       , decodeEnv
-       , decodeWithDefaults
        , decode
+       , decodeEnv
+       , decodeRaw
+       , decodeWithDefaults
+       , listErrors
        , showEnv
        , setEnvironment
        , setEnvironment'
@@ -70,6 +73,7 @@ module System.Envy
        , DefConfig (..)
        , Option (..)
        , runEnv
+       , runRaw
        , gFromEnvCustom
        ) where
 ------------------------------------------------------------------------------
@@ -78,6 +82,9 @@ import           Control.Monad.Except
 import           Control.Exception
 import           Data.Maybe
 import           Data.Char
+import           Data.Functor
+import           Data.Bifunctor (first)
+import           Data.List (intersperse)
 import           Data.Time
 import           GHC.Generics
 import           Data.Typeable
@@ -90,10 +97,29 @@ import           Data.Word
 import           Data.Int
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.ByteString.Lazy.Char8 as BL8
+
+------------------------------------------------------------------------------
+data ErrorItem = VarNotFound String | ParseFailure (String, TypeRep)
+  deriving (Eq)
+
+instance Show ErrorItem where
+  show (VarNotFound key) = "Variable not found for: " ++ key
+  show (ParseFailure (key,tr)) = "Parse failure: could not parse variable "
+                                 ++ show key ++ " into type "
+                                 ++ show tr
+newtype Errors = Errors [ErrorItem]
+  deriving (Eq, Semigroup, Monoid)
+
+instance Show Errors where
+   show (Errors l) = concat $ intersperse "\n" $ (show <$> l)
+
+listErrors :: Errors -> [ErrorItem]
+listErrors (Errors l) = l
+
 ------------------------------------------------------------------------------
 -- | Parser Monad for environment variable retrieval
-newtype Parser a = Parser { runParser :: ExceptT String IO a }
-  deriving ( Functor, Monad, Applicative, MonadError String
+newtype Parser a = Parser { runParser :: ExceptT Errors IO a }
+  deriving ( Functor, Monad, Applicative, MonadError Errors
            , MonadIO, Alternative, MonadPlus )
 
 ------------------------------------------------------------------------------
@@ -108,7 +134,7 @@ data EnvVar = EnvVar {
 
 ------------------------------------------------------------------------------
 -- | Executes `Parser`
-evalParser :: Parser a -> IO (Either String a)
+evalParser :: Parser a -> IO (Either Errors a)
 evalParser = runExceptT . runParser
 
 ------------------------------------------------------------------------------
@@ -117,7 +143,16 @@ evalParser = runExceptT . runParser
 -- > getPgConfig :: IO (Either String ConnectInfo)
 -- > getPgConfig = runEnv $ gFromEnvCustom defOption
 runEnv :: Parser a -> IO (Either String a)
-runEnv = runExceptT . runParser
+runEnv x =  evalParser x <&> first show
+
+
+------------------------------------------------------------------------------
+-- | For use with Generics, no `FromEnv` typeclass necessary
+--
+-- > getPgConfig :: IO (Either String ConnectInfo)
+-- > getPgConfig = runRaw $ gFromEnvCustom defOption
+runRaw :: Parser a -> IO (Either Errors a)
+runRaw x =  evalParser x
 
 ------------------------------------------------------------------------------
 -- | Environment variable getter. Fails if the variable is not set or
@@ -128,12 +163,10 @@ env :: Var a
 env key = do
   result <- liftIO (getEnv key)
   case result of
-    Nothing -> throwError $ "Variable not found for: " ++ key
+    Nothing -> throwError $ Errors [VarNotFound key]
     Just dv ->
       case fromVar dv of
-        Nothing -> throwError $ ("Parse failure: could not parse variable "
-                                 ++ show key ++ " into type "
-                                 ++ show (typeOf dv))
+        Nothing -> throwError $ Errors [ParseFailure (key, typeOf dv)]
         Just x -> return x
 
 ------------------------------------------------------------------------------
@@ -202,13 +235,24 @@ data Option = Option {
 defOption :: Option
 defOption = Option 0 mempty
 
+type T a x =  Either Errors (a x)
 ------------------------------------------------------------------------------
 -- | Products
 instance (GFromEnv a, GFromEnv b) => GFromEnv (a :*: b) where
-  gFromEnv opts ox = let (oa, ob) = case ox of
+  gFromEnv opts (ox :: Maybe ((a :*: b) x)) =
+                     let (oa, ob) = case ox of
                                              (Just (a :*: b)) -> (Just a, Just b)
-                                             _ -> (Nothing, Nothing) in
-                            liftA2 (:*:) (gFromEnv opts oa) (gFromEnv opts ob)
+                                             _ -> (Nothing, Nothing)
+                         ia = evalParser $ gFromEnv opts oa
+                         ib = evalParser $ gFromEnv opts ob in
+                     Parser . ExceptT $ ( (ia >>= \(ea :: T a x) ->
+                                          (ib >>= \(eb :: T b x) ->
+                                              return $ case (ea, eb) of
+                                                (Right ax, Right bx) -> Right (ax :*: bx)
+                                                (Left   e,  Left e') -> Left (e <> e')
+                                                (Left   e, _) -> Left e
+                                                (_, Left  e ) -> Left e
+                                          )))
 
 ------------------------------------------------------------------------------
 -- | Don't absorb meta data
@@ -308,10 +352,16 @@ instance Var a => Var (Maybe a) where
   fromVar "" = Nothing
   fromVar  s = Just <$> fromVar s
 
+
 ------------------------------------------------------------------------------
--- | Environment retrieval with failure info
+-- | Environment retrieval with raw failure info
+decodeRaw :: FromEnv a => IO (Either Errors a)
+decodeRaw = evalParser (fromEnv Nothing)
+
+------------------------------------------------------------------------------
+-- | Environment retrieval with textual failure info
 decodeEnv :: FromEnv a => IO (Either String a)
-decodeEnv = evalParser (fromEnv Nothing)
+decodeEnv = evalParser (fromEnv Nothing) <&> first show
 
 ------------------------------------------------------------------------------
 -- | Environment retrieval (with no failure info)
@@ -359,3 +409,4 @@ unsetEnvironment' = unsetEnvironment . toEnv
 -- | Display all environment variables, for convenience
 showEnv :: IO ()
 showEnv = mapM_ print =<< getEnvironment
+
