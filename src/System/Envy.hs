@@ -48,6 +48,7 @@
 module System.Envy
        ( -- * Classes
          FromEnv (..)
+       , GFromEnv(..)
        , ToEnv   (..)
        , Var     (..)
        , EnvList
